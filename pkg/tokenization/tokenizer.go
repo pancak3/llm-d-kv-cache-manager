@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/daulet/tokenizers"
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -365,10 +366,14 @@ func (t *CachedTokenizer) get(modelName string) (*tokenizers.Tokenizer, error) {
 	return tokenizer, nil
 }
 
+var mu sync.Mutex
+
 func (t *CachedTokenizer) RenderChatTemplate(
 	modelName string, renderReq *preprocessing.RenderJinjaTemplateRequest,
 ) (string, error) {
 	ctx := context.TODO()
+	mu.Lock()
+	defer mu.Unlock()
 
 	if renderReq.ChatTemplate == "" {
 		req, err := getFetchChatTemplateRequest(modelName, t.tokenizerProvider)
@@ -387,7 +392,6 @@ func (t *CachedTokenizer) RenderChatTemplate(
 	if err != nil {
 		return "", fmt.Errorf("failed to render chat template: %w", err)
 	}
-
 	return res.RenderedChats[0], nil
 }
 

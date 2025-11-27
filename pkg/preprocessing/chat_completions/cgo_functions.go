@@ -48,7 +48,8 @@ type RenderJinjaTemplateRequest struct {
 	ChatTemplate              string                 `json:"chat_template,omitempty"`
 	ReturnAssistantTokensMask bool                   `json:"return_assistant_tokens_mask,omitempty"`
 	ContinueFinalMessage      bool                   `json:"continue_final_message,omitempty"`
-	AddGenerationPrompt       bool                   `json:"add_generation_prompt,omitempty"`
+	AddGenerationPrompt       *bool                  `json:"add_generation_prompt,omitempty"`
+	TruncatePromptTokens      *int                   `json:"truncate_prompt_tokens,omitempty"`
 	ChatTemplateKWArgs        map[string]interface{} `json:"chat_template_kwargs,omitempty"`
 }
 
@@ -91,11 +92,7 @@ type FetchChatTemplateResponse struct {
 	ChatTemplateKWArgs map[string]interface{} `json:"chat_template_kwargs,omitempty"`
 }
 
-// ChatTemplatingProcessor is a processor that handles chat template rendering
-// using a cached Python function. Once the Python interpreter is initialized,
-// it caches the `transformers` function `render_jinja_template` for rendering
-// chat templates. It also provides a method to fetch chat templates from the
-// tokenizer or HuggingFace if the tokenizer is not present.
+// ChatTemplatingProcessor handles chat template rendering using a Python wrapper.
 type ChatTemplatingProcessor struct{}
 
 // NewChatTemplatingProcessor creates a new instance of ChatTemplatingProcessor.
@@ -145,23 +142,48 @@ func (w *ChatTemplatingProcessor) RenderChatTemplate(ctx context.Context,
 		traceLogger.Error(err, "Failed to marshal request")
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
-	// Call the cached Python function
-	cResult := C.Py_CallRenderJinjaTemplate(C.CString(string(reqJSON)))
-	if cResult == nil {
-		traceLogger.Error(nil, "C function returned nil")
-		return nil, fmt.Errorf("python render_jinja_template failed")
-	}
-	defer C.free(unsafe.Pointer(cResult))
-	resultJSON := C.GoString(cResult)
 
-	// Parse the response
-	var response RenderJinjaTemplateResponse
-	if err := json.Unmarshal([]byte(resultJSON), &response); err != nil {
-		traceLogger.Error(err, "Failed to unmarshal response")
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	type result struct {
+		cResult *C.char
 	}
+	done := make(chan result, 1)
 
-	return &response, nil
+	cReqJSON := C.CString(string(reqJSON))
+
+	go func() {
+		defer C.free(unsafe.Pointer(cReqJSON))
+		// Call the cached Python function
+		res := C.Py_CallRenderJinjaTemplate(cReqJSON)
+		done <- result{cResult: res}
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Spawn a cleaner to free the result when it eventually arrives
+		go func() {
+			res := <-done
+			if res.cResult != nil {
+				C.free(unsafe.Pointer(res.cResult))
+			}
+		}()
+		return nil, ctx.Err()
+	case res := <-done:
+		if res.cResult == nil {
+			traceLogger.Error(nil, "C function returned nil")
+			return nil, fmt.Errorf("python render_jinja_template failed")
+		}
+		defer C.free(unsafe.Pointer(res.cResult))
+		resultJSON := C.GoString(res.cResult)
+
+		// Parse the response
+		var response RenderJinjaTemplateResponse
+		if err := json.Unmarshal([]byte(resultJSON), &response); err != nil {
+			traceLogger.Error(err, "Failed to unmarshal response")
+			return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+		}
+		traceLogger.Info("Successfully rendered chat template", "response", response)
+		return &response, nil
+	}
 }
 
 // FetchChatTemplate fetches the model chat template using the cached Python function.
@@ -173,29 +195,66 @@ func (w *ChatTemplatingProcessor) FetchChatTemplate(
 ) (string, map[string]interface{}, error) {
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("FetchChatTemplate")
 
+	// Fetch from Python without the ChatTemplate override
+	// to get the model's default template and kwargs.
+	fetchReq := req
+	fetchReq.ChatTemplate = "" // Clear override to fetch default
+
 	// Convert request to JSON
-	reqJSON, err := json.Marshal(req)
+	reqJSON, err := json.Marshal(fetchReq)
 	if err != nil {
 		traceLogger.Error(err, "Failed to marshal request")
 		return "", nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
-	// Call the cached Python function
-	cResult := C.Py_CallGetModelChatTemplate(C.CString(string(reqJSON)))
-	if cResult == nil {
-		traceLogger.Error(nil, "C function returned nil")
-		return "", nil, fmt.Errorf("python get_model_chat_template failed")
-	}
-	defer C.free(unsafe.Pointer(cResult))
-	resultJSON := C.GoString(cResult)
 
-	// Parse the response
-	var response FetchChatTemplateResponse
-	if err := json.Unmarshal([]byte(resultJSON), &response); err != nil {
-		traceLogger.Error(err, "Failed to unmarshal response")
-		return "", nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	type result struct {
+		cResult *C.char
+	}
+	done := make(chan result, 1)
+
+	cReqJSON := C.CString(string(reqJSON))
+
+	go func() {
+		defer C.free(unsafe.Pointer(cReqJSON))
+		// Call the cached Python function
+		res := C.Py_CallGetModelChatTemplate(cReqJSON)
+		done <- result{cResult: res}
+	}()
+
+	var cachedResp FetchChatTemplateResponse
+
+	select {
+	case <-ctx.Done():
+		// Spawn a cleaner to free the result when it eventually arrives
+		go func() {
+			res := <-done
+			if res.cResult != nil {
+				C.free(unsafe.Pointer(res.cResult))
+			}
+		}()
+		return "", nil, ctx.Err()
+	case res := <-done:
+		if res.cResult == nil {
+			traceLogger.Error(nil, "C function returned nil")
+			return "", nil, fmt.Errorf("python get_model_chat_template failed")
+		}
+		defer C.free(unsafe.Pointer(res.cResult))
+		resultJSON := C.GoString(res.cResult)
+
+		// Parse the response
+		if err := json.Unmarshal([]byte(resultJSON), &cachedResp); err != nil {
+			traceLogger.Error(err, "Failed to unmarshal response")
+			return "", nil, fmt.Errorf("failed to unmarshal response: %w", err)
+		}
 	}
 
-	return response.ChatTemplate, response.ChatTemplateKWArgs, nil
+	// Apply override logic
+	template := cachedResp.ChatTemplate
+	if req.ChatTemplate != "" {
+		template = req.ChatTemplate
+	}
+
+	return template, cachedResp.ChatTemplateKWArgs, nil
 }
 
 // ClearCaches clears all caches for testing purposes.

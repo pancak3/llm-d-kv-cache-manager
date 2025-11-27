@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/daulet/tokenizers"
 	preprocessing "github.com/llm-d/llm-d-kv-cache-manager/pkg/preprocessing/chat_completions"
 	"github.com/llm-d/llm-d-kv-cache-manager/pkg/tokenization/prefixstore"
 )
@@ -63,6 +64,7 @@ func DefaultConfig() (*Config, error) {
 // tokenizationResponse holds the result of a tokenization operation.
 type tokenizationResponse struct {
 	Tokens []uint32
+	Error  error
 }
 
 // Task represents a unit of work for tokenizing a prompt.
@@ -146,7 +148,7 @@ func (pool *Pool) EnqueueTokenization(prompt, modelName string) {
 }
 
 // Tokenize queues a task and blocks until the final result is available.
-func (pool *Pool) Tokenize(renderReq *preprocessing.RenderJinjaTemplateRequest, prompt, modelName string) []uint32 {
+func (pool *Pool) Tokenize(renderReq *preprocessing.RenderJinjaTemplateRequest, prompt, modelName string) ([]uint32, error) {
 	resultCh := make(chan tokenizationResponse, 1)
 	pool.queue.Add(Task{
 		RenderReq: renderReq,
@@ -156,8 +158,7 @@ func (pool *Pool) Tokenize(renderReq *preprocessing.RenderJinjaTemplateRequest, 
 	})
 
 	res := <-resultCh
-	tokens := res.Tokens
-	return tokens
+	return res.Tokens, res.Error
 }
 
 // Run launches worker goroutines that process tasks until the context is
@@ -196,29 +197,40 @@ func (pool *Pool) workerLoop(_ int) {
 // processTask tokenizes the prompt and updates the indexer.
 // It sends exactly one response (success or error) if ResultCh is provided.
 func (pool *Pool) processTask(task Task) error {
+	var err error
 	if task.RenderReq != nil {
-		var err error
 		task.Prompt, err = pool.tokenizer.RenderChatTemplate(task.ModelName, task.RenderReq)
 		if err != nil {
 			log.Log.Error(err, "failed to render chat template", "modelName", task.ModelName)
-			return err
+			return pool.handleTaskError(task, err)
 		}
 	}
 
 	tokenIDs, overlapRatio := pool.indexer.FindLongestContainedTokens(task.Prompt, task.ModelName)
 
+	// We need full tokenization if:
+	// 1. The overlap ratio is low (optimization: skip suffix for scoring if it's small)
+	// 2. OR we need to truncate prompt tokens. In this case we need the *end* of the prompt (suffix),
+	//    so we cannot rely on a prefix match unless it's a full match (overlapRatio == 1.0).
+	shouldTokenize := overlapRatio < pool.minPrefixOverlapRatio
+	if task.RenderReq != nil && task.RenderReq.TruncatePromptTokens != nil && overlapRatio < 1.0 {
+		shouldTokenize = true
+	}
+
 	// if the overlap ratio is low, get the full tokenization
-	if overlapRatio < pool.minPrefixOverlapRatio {
-		tokens, offsets, err := pool.tokenizer.Encode(task.Prompt, task.ModelName)
+	if shouldTokenize {
+		var tokens []uint32
+		var offsets []tokenizers.Offset
+		tokens, offsets, err = pool.tokenizer.Encode(task.Prompt, task.ModelName)
 		if err != nil {
 			log.Log.Error(err, "failed to encode tokens", "prompt", task.Prompt, "modelName", task.ModelName)
-			return err
+			return pool.handleTaskError(task, err)
 		}
 
 		// update the indexer with the new tokenization
 		if e := pool.indexer.AddTokenization(task.ModelName, task.Prompt, tokens, offsets); e != nil {
 			err = fmt.Errorf("tokenization failed for model %s: %w", task.ModelName, e)
-			return err
+			return pool.handleTaskError(task, err)
 		}
 
 		tokenIDs = tokens
@@ -234,4 +246,13 @@ func (pool *Pool) processTask(task Task) error {
 	}
 
 	return nil
+}
+
+func (pool *Pool) handleTaskError(task Task, err error) error {
+	if task.ResultCh != nil {
+		task.ResultCh <- tokenizationResponse{Error: err}
+		close(task.ResultCh)
+		return nil // Don't retry if someone is waiting and we notified them
+	}
+	return err
 }

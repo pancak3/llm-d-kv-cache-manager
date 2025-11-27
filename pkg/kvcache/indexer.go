@@ -135,7 +135,17 @@ func (k *Indexer) GetPodScores(ctx context.Context, renderReq *preprocessing.Ren
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvcache.GetPodScores")
 
 	// 1. tokenize prompt
-	tokens := k.tokenizersPool.Tokenize(renderReq, prompt, modelName)
+	tokens, err := k.tokenizersPool.Tokenize(renderReq, prompt, modelName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to tokenize prompt: %w", err)
+	}
+
+	if renderReq != nil && renderReq.TruncatePromptTokens != nil {
+		limit := *renderReq.TruncatePromptTokens
+		if limit > 0 && len(tokens) > limit {
+			tokens = tokens[len(tokens)-limit:]
+		}
+	}
 
 	// 2. get block keys
 	blockKeys := k.tokensProcessor.TokensToKVBlockKeys(tokens, modelName)
@@ -152,15 +162,15 @@ func (k *Indexer) GetPodScores(ctx context.Context, renderReq *preprocessing.Ren
 	if err != nil {
 		return nil, fmt.Errorf("failed to query kvblock indexer: %w", err)
 	}
-	traceLogger.Info("found block keys", "block-keys", blockKeys,
-		"pods", podsPerKeyPrintHelper(keyToPods))
+	traceLogger.Info("generated block keys", "block-keys", blockKeys,
+		"found_pods", podsPerKeyPrintHelper(keyToPods))
 
 	// 4. score pods
 	podScores, err := k.kvBlockScorer.Score(blockKeys, keyToPods)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query kvblock scorer: %w", err)
 	}
-	traceLogger.Info("found pod scores", "pod-scores", podScores)
+	traceLogger.Info("computed pod scores", "pod-scores", podScores)
 
 	return podScores, nil
 }
