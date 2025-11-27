@@ -126,7 +126,6 @@ func (db *ChunkedTokenDatabase) prefixHashes(parentHash []byte, tokenChunks [][]
 	hashes := make([][]byte, len(tokenChunks))
 	for i, chunk := range tokenChunks {
 		prefix = db.hash(prefix, chunk, nil)
-		log.FromContext(context.Background()).Info("[*] Hashed chunk", "chunk_index", i, "chunk_tokens", chunk, "hash", prefix)
 		hashes[i] = prefix
 	}
 	return hashes

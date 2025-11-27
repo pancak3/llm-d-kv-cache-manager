@@ -106,9 +106,6 @@ func (m *InMemoryIndex) Lookup(ctx context.Context, keys []Key,
 	podsPerKey := make(map[Key][]PodEntry)
 	highestHitIdx := 0
 
-	// print out m.data for debugging
-	traceLogger.Info("[*] keys in cache", "keys", m.data.Keys())
-
 	for idx, key := range keys {
 		if pods, found := m.data.Get(key); found { //nolint:nestif // TODO: can this be optimized?
 			if pods == nil || pods.cache.Len() == 0 {
